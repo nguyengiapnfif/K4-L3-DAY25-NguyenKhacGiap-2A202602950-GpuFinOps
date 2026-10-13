@@ -48,3 +48,20 @@ def test_ext3_low_reads_disables_cache_high_reads_cheaper():
     assert low["cached_requests"] == 0 and low["cost"] == r["no_cache_daily"]
     assert high["cost"] < low["cost"]
     assert high["cost"] >= r["m2_optimized_daily"]
+
+
+def test_ext5_regions_and_savings():
+    from missions import ext5_carbon_scheduling as e5
+    r = e5.run(verbose=False, write=False)
+    assert r["cleanest"] == "europe-north1" and r["cheapest"] == "us-east-wa"
+    assert r["best_gco2"] < r["base_gco2"]
+    assert abs(r["base_gco2"] - r["total_kwh"] * 380) < 1e-6
+
+
+def test_ext4_reasoning_budget():
+    from missions import ext4_reasoning_budget as e4
+    r = e4.run(verbose=False, write=False)
+    assert r["wh_share"] > r["share"] and r["usd_share"] > r["share"]
+    by = {c["cap"]: c for c in r["caps"]}
+    assert r["share"] < 0.10 and by[0.10]["usd_saved_day"] == 0 and by[0.10]["wh_saved_day"] == 0
+    assert by[0.02]["wh_saved_day"] > by[0.05]["wh_saved_day"] > 0
