@@ -60,21 +60,92 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# ASSUMPTION (not from the dataset): per-hour spot reclaim probability by GPU type.
+# Scarce, high-demand parts are reclaimed less often than small inference cards
+# in deep pools; values are illustrative planning numbers, re-measure per region.
+SPOT_INTERRUPT_RATE = {
+    "H100": 0.03, "H200": 0.03, "B200": 0.04, "A100": 0.05,
+    "MI300X": 0.06, "A10G": 0.08, "L4": 0.08,
+}
+DEFAULT_INTERRUPT_RATE = 0.05
+
+
+def interrupt_rate(gpu_type: str | None) -> float:
+    return SPOT_INTERRUPT_RATE.get(gpu_type, DEFAULT_INTERRUPT_RATE)
+
+
+def _lockin_factor(horizon_months: float, term_months: int) -> float:
+    """Months paid per month used: commitments are bought in whole terms."""
+    horizon_months = max(horizon_months, 1e-9)
+    terms = max(1, -(-horizon_months // term_months))  # ceil
+    return terms * term_months / horizon_months
+
+
+def tier_costs(
+    gpu_type: str,
+    prices: dict,
+    gpu_hours: float,
+    hours_per_day: float,
+    interruptible: bool,
+    horizon_months: float,
+) -> dict:
+    """Monthly cost of every purchasing option that is *eligible* for the job.
+
+    prices: on_demand_hr, spot_hr, reserved_1yr_hr, reserved_3yr_hr.
+    - on_demand: used hours x on-demand rate.
+    - spot: only if interruptible; includes checkpoint + rework at the GPU's own
+      interruption rate.
+    - reserved_1yr / reserved_3yr: only if duty cycle >= that term's break-even
+      (rate / on-demand). Cost is inflated by the lock-in factor, i.e. the part
+      of the term that outlives the workload is still paid for.
+    """
+    od = prices["on_demand_hr"]
+    duty = max(0.0, hours_per_day) / 24.0
+    out = {"on_demand": gpu_hours * od}
+    if interruptible and hours_per_day < 24:
+        out["spot"] = spot_checkpoint_cost(
+            gpu_hours, prices["spot_hr"], od, interrupt_rate=interrupt_rate(gpu_type)
+        )["spot_cost"]
+    for key, term in (("reserved_1yr", 12), ("reserved_3yr", 36)):
+        rate = prices[f"{key}_hr"]
+        if od > 0 and duty >= rate / od:
+            out[key] = gpu_hours * rate * _lockin_factor(horizon_months, term)
+    return out
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    prices: dict | None = None,
+    horizon_months: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Legacy policy (when `prices` is not given), unchanged:
+      - interruptible & not 24/7  -> 'spot'
+      - duty cycle >= break-even  -> 'reserved'
+      - otherwise                 -> 'on_demand'
+
+    Cost-aware policy (when `prices` + `gpu_type` are given): cheapest of
+    tier_costs(); returns 'spot' | 'reserved_1yr' | 'reserved_3yr' | 'on_demand'.
+    Horizon = horizon_months, else job_days/30, else 12 months.
     """
-    duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
-        return "reserved"
-    return "on_demand"
+    if prices is None:
+        duty = max(0.0, hours_per_day) / 24.0
+        be = break_even_utilization(reserved_discount)
+        if interruptible and hours_per_day < 24:
+            return "spot"
+        if duty >= be:
+            return "reserved"
+        return "on_demand"
+
+    if horizon_months is None:
+        horizon_months = job_days / 30.0 if job_days else 12.0
+    costs = tier_costs(gpu_type, prices, 1.0, hours_per_day, interruptible, horizon_months)
+    return min(costs, key=costs.get)
 
 
 def spot_checkpoint_cost(
@@ -102,3 +173,30 @@ def spot_checkpoint_cost(
         "on_demand_cost": round(on_demand_cost, 2),
         "savings_pct": round(savings_pct, 1),
     }
+
+
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 3.00,
+) -> float:
+    """Reads per cached prefix needed before caching pays for itself.
+
+    write_cost_per_m: EXTRA $/1M cached tokens to create/store the cache beyond
+    normal input processing (Anthropic 5-min write = 1.25x input -> 0.25 x price;
+    Gemini bills storage per token-hour). Each read saves price x (1 - read_discount).
+    """
+    saving_per_read = price_in_per_m * (1.0 - read_discount)
+    if saving_per_read <= 0:
+        return float("inf")
+    return max(0.0, write_cost_per_m) / saving_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 3.00,
+) -> bool:
+    """Cache only saves money when read savings exceed the write cost."""
+    return avg_cache_reads > cache_break_even_reads(write_cost_per_m, read_discount, price_in_per_m)
